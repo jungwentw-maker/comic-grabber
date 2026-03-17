@@ -15,7 +15,7 @@ from parsers.dm5_parser import (
     extract_title_and_chapter_from_html,
     normalize_dm5_template,
 )
-from parsers.rss_parser import parse_rss_xml_to_queue
+from parsers.rss_parsers import parse_rss_xml_to_queue
 from utils.text_utils import clean_html_text, sanitize_path_part
 
 
