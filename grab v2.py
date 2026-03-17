@@ -66,6 +66,8 @@ class DM5CrawlerApp:
         self.max_concurrent_var = tk.StringVar(value="5")
         self.image_format_var = tk.StringVar(value="JPG & PNG")
         self.manual_verify_var = tk.BooleanVar(value=False)
+        self.manual_verify_pending = False        
+        self.chapter_progress_var = tk.StringVar(value="章節進度：0/0 (0%)")
 
         self._build_ui()
 
@@ -139,6 +141,9 @@ class DM5CrawlerApp:
         middle = ttk.Frame(self.root, padding=(10, 0, 10, 10))
         middle.pack(fill="both", expand=True)
         ttk.Label(middle, textvariable=self.status_var).pack(anchor="w", pady=(0, 4))
+        ttk.Label(middle, textvariable=self.chapter_progress_var).pack(anchor="w")
+        self.chapter_progress_bar = ttk.Progressbar(middle, orient="horizontal", mode="determinate", maximum=100)
+        self.chapter_progress_bar.pack(fill="x", pady=(2, 6))
         
         paned = ttk.PanedWindow(middle, orient=tk.HORIZONTAL)
         paned.pack(fill="both", expand=True)
@@ -241,12 +246,22 @@ class DM5CrawlerApp:
 
     def build_filename(self, index: int, page_num: int, url: str) -> str:
         parsed = urlparse(url)
-        base, ext = os.path.splitext(os.path.basename(parsed.path))
-        safe_base = re.sub(r"[^a-zA-Z0-9._-]+", "_", base).strip("_") or f"image_{index:03d}"
+        _, ext = os.path.splitext(os.path.basename(parsed.path))
         ext = ext.lower()
         if ext == ".jpeg": ext = ".jpg"
         elif ext not in {".jpg", ".png"}: ext = ".jpg"
-        return f"p{page_num:03d}_{index:03d}_{safe_base}{ext}"
+        if index == 1:
+            return f"{page_num:03d}{ext}"
+        return f"{page_num:03d}-{index-1}{ext}"
+
+    def update_chapter_progress(self, completed: int, total: int) -> None:
+        if total <= 0:
+            self.chapter_progress_var.set("章節進度：0/0 (0%)")
+            self.chapter_progress_bar["value"] = 0
+            return
+        percent = int((completed / total) * 100)
+        self.chapter_progress_var.set(f"章節進度：{completed}/{total} ({percent}%)")
+        self.chapter_progress_bar["value"] = percent
 
     def is_probably_comic_image(self, url: str) -> bool:
         lowered = url.lower()
@@ -410,6 +425,8 @@ class DM5CrawlerApp:
         self.reset_control_state()
         self.clear_log()
         self.set_status(f"開始下載佇列中的 {len(self.target_queue)} 個項目...")
+        self.manual_verify_pending = self.manual_verify_var.get()        
+        self.update_chapter_progress(0, len(self.target_queue))
         
         # 啟動唯一一個 Thread 來執行整個佇列
         threading.Thread(target=self._queue_download_worker, daemon=True).start()
@@ -441,6 +458,12 @@ class DM5CrawlerApp:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=False)
             context = await browser.new_context(viewport={"width": 1400, "height": 900}, user_agent=UA)
+
+            if self.manual_verify_pending and self.target_queue:
+                first_chapter_url = self.target_queue[0][1]
+                await self._manual_verify_gate(context, first_chapter_url, 1)
+                self.manual_verify_pending = False
+                self.root.after(0, lambda: self.manual_verify_var.set(False))
             
             for idx, (chapter_title, chapter_url) in enumerate(self.target_queue, 1):
                 if self.cancel_event.is_set(): break
@@ -460,14 +483,16 @@ class DM5CrawlerApp:
                 
                 # 傳入 shared context 進行單話下載
                 await self._download_chapter_async(context, chapter_title, 1, max_page)
+                self.root.after(0, lambda i=idx, t=total_items: self.update_chapter_progress(i, t))
                 
                 self.root.after(0, lambda t=chapter_title: self.append_log(f"<<< {t} 處理完成\n{'='*40}\n"))
-            
+
             # 整個佇列跑完後才關閉瀏覽器
             await browser.close()
             
         if not self.cancel_event.is_set():
             self.root.after(0, lambda: self.set_status("佇列下載完成！"))
+            self.root.after(0, lambda t=total_items: self.update_chapter_progress(t, t))
             self.root.after(0, lambda: messagebox.showinfo("完成", "佇列中所有項目已下載完成！"))
         else:
             self.root.after(0, lambda: self.set_status("任務已終止"))
@@ -544,15 +569,6 @@ class DM5CrawlerApp:
                 await page.close()
                 return 0, 0
                 
-            start_page = self.get_int(self.start_page_var.get(), "起始頁")
-            if page_num == start_page and self.manual_verify_var.get():
-                self.root.after(0, lambda n=page_num: self.append_log(f"[頁 {n}] 觸發手動通關，已自動暫停。\n"))
-                self.pause_event_async.clear()
-                self.is_paused = True
-                self.root.after(0, lambda: self.pause_btn.config(text="▶ 繼續"))
-                self.root.after(0, lambda: self.set_status("已暫停 (等待手動繼續...)"))
-                self.root.after(0, lambda: self.manual_verify_var.set(False))
-            
             await self.wait_if_paused()
             await page.wait_for_timeout(2500)
 
@@ -658,6 +674,25 @@ class DM5CrawlerApp:
 
         self.root.after(0, lambda s=total_success, f=total_fail: self.append_log(f"單話下載完成，成功 {s}，失敗 {f}\n"))
 
+    async def _manual_verify_gate(self, context, chapter_url: str, first_page_num: int = 1) -> None:
+        timeout = self.get_int(self.timeout_var.get(), "頁面 timeout")
+        template = self.normalize_dm5_template(chapter_url)
+        first_url = template.replace("(#)", str(first_page_num))
+        page = await context.new_page()
+        page.set_default_timeout(timeout)
+        self.root.after(0, lambda u=first_url: self.append_log(f"[手動通關] 先開啟第一頁：{u}\n"))
+        try:
+            await page.goto(first_url, wait_until="domcontentloaded")
+        except PlaywrightTimeoutError:
+            pass
+        self.pause_event_async.clear()
+        self.is_paused = True
+        self.root.after(0, lambda: self.pause_btn.config(text="▶ 繼續"))
+        self.root.after(0, lambda: self.set_status("已暫停 (請先手動通關，完成後按繼續)"))
+        self.root.after(0, lambda: self.append_log("[手動通關] 已暫停，請在瀏覽器完成驗證後按「繼續」。\n"))
+        await self.wait_if_paused()
+        await page.close()
+        self.root.after(0, lambda: self.append_log("[手動通關] 已通過，開始正式下載本話頁面。\n"))
 
 def main() -> None:
     root = tk.Tk()
